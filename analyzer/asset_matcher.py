@@ -1,97 +1,190 @@
 """
-资产匹配模块 - 将 CVE 与本地资产库进行匹配
+资产匹配模块 - 将 CVE 与本地资产库进行精确匹配（CPE + 关键词混合）
+
+匹配策略（优先级从高到低）：
+1. CPE 精确匹配：vendor + product + version 完全一致
+2. CPE 产品匹配：vendor + product 一致，版本范围覆盖
+3. 关键词匹配：产品名在描述/受影响产品中出现
 """
-import json
-import os
-
-ASSETS_FILE = os.path.join(os.path.dirname(__file__), "..", "memory", "assets.json")
-
-
-def load_assets():
-    """加载本地资产库"""
-    try:
-        with open(ASSETS_FILE, "r", encoding="utf-8") as f:
-            assets = json.load(f)
-        print(f"📦 已加载 {len(assets)} 个资产")
-        return assets
-    except FileNotFoundError:
-        print("⚠️ 未找到资产文件，请创建 memory/assets.json")
-        return []
-    except json.JSONDecodeError:
-        print("⚠️ 资产文件格式错误")
-        return []
-
-
-def save_assets(assets):
-    """保存资产库"""
-    with open(ASSETS_FILE, "w", encoding="utf-8") as f:
-        json.dump(assets, f, ensure_ascii=False, indent=2)
-    print(f"💾 已保存 {len(assets)} 个资产")
+import re
+from database.db_manager import load_assets, add_asset_to_db, remove_asset_from_db, get_all_assets
 
 
 def add_asset(product, version="unknown"):
     """添加单个资产"""
-    assets = load_assets()
-    # 检查是否已存在
-    for a in assets:
-        if a["product"].lower() == product.lower():
-            a["version"] = version
-            save_assets(assets)
-            return {"status": "updated", "product": product, "version": version}
-    assets.append({"product": product, "version": version})
-    save_assets(assets)
+    add_asset_to_db(product=product, version=version)
     return {"status": "added", "product": product, "version": version}
 
 
 def remove_asset(product):
     """删除资产"""
-    assets = load_assets()
-    new_assets = [a for a in assets if a["product"].lower() != product.lower()]
-    if len(new_assets) == len(assets):
-        return {"status": "not_found", "product": product}
-    save_assets(new_assets)
-    return {"status": "removed", "product": product}
+    result = remove_asset_from_db(product)
+    if result:
+        return {"status": "removed", "product": product}
+    return {"status": "not_found", "product": product}
+
+
+def _normalize_product_name(name):
+    """标准化产品名：小写、去空格、统一常见变体"""
+    n = name.lower().strip()
+    # 常见变体映射
+    mapping = {
+        "apache http server": "apache",
+        "apache httpd": "apache",
+        "httpd": "apache",
+        "apache tomcat": "tomcat",
+        "nginx": "nginx",
+        "open ssh": "openssh",
+        "openssh": "openssh",
+        "microsoft windows": "windows",
+        "windows server": "windows server",
+        "linux kernel": "linux",
+        "openssl": "openssl",
+        "vmware": "vmware",
+    }
+    return mapping.get(n, n)
+
+
+def _version_match(asset_version, cpe_version):
+    """
+    检查资产版本是否在 CVE 影响范围内
+
+    NVD CPE 中的版本可能是：
+    - 精确版本: "2.4.51"
+    - 通配符:   "*" (所有版本)
+    - 范围前缀: "2.4" (2.4.x 全部)
+    """
+    asset_v = str(asset_version).lower().strip()
+    cpe_v = str(cpe_version).lower().strip()
+
+    if cpe_v == "*" or cpe_v == "-":
+        return True
+    if asset_v in ("unknown", "", "-"):
+        return False
+
+    # 精确匹配
+    if asset_v == cpe_v:
+        return True
+
+    # 前缀匹配：cpe 版本是 "2.4"，资产版本是 "2.4.51"
+    if asset_v.startswith(cpe_v + "."):
+        return True
+    if cpe_v.startswith(asset_v + "."):
+        return True
+
+    return False
 
 
 def match_assets(cves):
     """
     将 CVE 漏洞与本地资产进行匹配
-    同时给每个 CVE 打上 asset_hit 标记
+
+    三层匹配策略：
+    1. CPE 精确匹配（vendor:product:version）
+    2. CPE 产品匹配（vendor:product，版本覆盖）
+    3. 关键词降级匹配（产品名出现在描述中）
     """
     assets = load_assets()
     if not assets:
-        # 无资产，标记所有 CVE 为未命中
         for cve in cves:
             cve["asset_hit"] = False
         return []
 
+    # 预处理资产：标准化名称
+    normalized_assets = []
+    for a in assets:
+        normalized_assets.append({
+            **a,
+            "_normalized": _normalize_product_name(a.get("product", "")),
+        })
+
     alerts = []
-    asset_product_names = [a["product"].lower() for a in assets]
 
     for cve in cves:
-        desc = cve.get("description", "").lower()
-        affected = [p.lower() for p in cve.get("affected_products", [])]
-
+        matched = False
         matched_product = None
-        for asset in assets:
-            product = asset["product"].lower()
-            if product in desc or any(product in a for a in affected):
-                matched_product = asset
+        matched_method = None
+
+        # 受影响产品列表（从 CPE 解析出的结构化数据）
+        cpe_products = cve.get("affected_products", [])
+        # 兼容旧格式（字符串列表）
+        cpe_strings = cve.get("affected_cpes", [])
+        desc = cve.get("description", "").lower()
+
+        for asset in normalized_assets:
+            asset_norm = asset["_normalized"]
+            asset_ver = str(asset.get("version", "unknown")).lower()
+
+            # ── 策略 1: CPE 精确匹配 ──
+            if not matched and cpe_products:
+                for cp in cpe_products:
+                    cp_vendor = cp.get("vendor", "").lower()
+                    cp_product = cp.get("product", "").lower()
+                    cp_version = cp.get("version", "")
+
+                    if (asset_norm == _normalize_product_name(cp_product)
+                            and _version_match(asset_ver, cp_version)):
+                        matched = True
+                        matched_product = asset
+                        matched_method = "cpe_exact"
+                        break
+
+            # ── 策略 2: CPE 产品匹配（只看产品名，版本覆盖） ──
+            if not matched and cpe_products:
+                for cp in cpe_products:
+                    cp_product = cp.get("product", "").lower()
+                    cp_version = cp.get("version", "")
+
+                    if (asset_norm == _normalize_product_name(cp_product)
+                            and cp_version in ("*", "-", "")):
+                        # 版本通配，说明所有版本受影响
+                        matched = True
+                        matched_product = asset
+                        matched_method = "cpe_wildcard"
+                        break
+
+                    if (asset_norm == _normalize_product_name(cp_product)
+                            and _version_match(asset_ver, cp_version)):
+                        matched = True
+                        matched_product = asset
+                        matched_method = "cpe_version"
+                        break
+
+            # ── 策略 3: 关键词降级匹配 ──
+            if not matched:
+                keywords = [asset_norm]
+                # 常见品牌别名
+                aliases = {
+                    "apache": ["apache http", "httpd"],
+                    "nginx": ["nginx"],
+                    "openssl": ["openssl", "libssl"],
+                    "vmware": ["vmware", "vcenter", "esxi"],
+                    "windows server": ["windows server", "microsoft windows server"],
+                }
+                keywords.extend(aliases.get(asset_norm, []))
+
+                for kw in keywords:
+                    if kw in desc:
+                        matched = True
+                        matched_product = asset
+                        matched_method = "keyword"
+                        break
+
+            if matched:
                 break
 
-        if matched_product:
-            cve["asset_hit"] = True
+        cve["asset_hit"] = matched
+        if matched and matched_product:
             alerts.append({
                 "cve_id": cve["cve_id"],
                 "product": matched_product["product"],
                 "version": matched_product.get("version", "unknown"),
                 "severity": cve.get("severity", "unknown"),
                 "score": cve.get("score", 0),
-                "description": cve.get("description", "")[:100],
+                "description": cve.get("description", "")[:200],
+                "match_method": matched_method,
                 "exploit": cve.get("exploit", {}),
             })
-        else:
-            cve["asset_hit"] = False
 
     return alerts
 
@@ -105,13 +198,16 @@ def format_asset_alerts(alerts):
     for alert in alerts:
         exploit_tag = ""
         if isinstance(alert.get("exploit"), dict) and alert["exploit"].get("has_exploit"):
-            exploit_tag = " 🔥已存在利用代码"
+            source = alert["exploit"].get("source", "EXPLOIT")
+            exploit_tag = f"  ⚠️ 已存在{source}利用代码"
+
+        method_tag = f" [{alert.get('match_method', 'unknown')}匹配]"
 
         lines.append(
             f"  {alert['cve_id']}  |  "
             f"{alert['product']} {alert['version']}  |  "
             f"[{alert['severity']}] CVSS {alert['score']}"
-            f"{exploit_tag}"
+            f"{method_tag}{exploit_tag}"
         )
         lines.append(f"    {alert['description']}")
 

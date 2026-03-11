@@ -1,5 +1,5 @@
 """
-数据库模块 - 标准化数据存储层
+数据库模块 - 标准化数据存储层（连接池单例版）
 
 4 个核心集合：
 - cves: CVE 漏洞情报
@@ -11,6 +11,7 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+import threading
 
 load_dotenv()
 
@@ -20,15 +21,31 @@ COL_ASSETS = "assets"
 COL_RISKS = "risks"
 COL_REPORTS = "reports"
 
+# ── 单例连接池 ──
+_client = None
+_db = None
+_lock = threading.Lock()
+
 
 def get_client() -> MongoClient:
-    uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-    return MongoClient(uri)
+    """获取全局 MongoClient 单例"""
+    global _client
+    if _client is None:
+        with _lock:
+            if _client is None:
+                uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+                _client = MongoClient(uri, maxPoolSize=20, minPoolSize=5, connectTimeoutMS=5000)
+    return _client
 
 
 def get_db():
-    client = get_client()
-    return client[os.getenv("MONGO_DB", "threat_intel")]
+    """获取数据库实例"""
+    global _db
+    if _db is None:
+        with _lock:
+            if _db is None:
+                _db = get_client()[os.getenv("MONGO_DB", "threat_intel")]
+    return _db
 
 
 def init_collections():
@@ -39,14 +56,12 @@ def init_collections():
     try:
         db[COL_CVES].create_index([("cve_id", ASCENDING)], unique=True)
     except Exception:
-        # 已有重复数据，先去重再建索引
         print("⚠️ CVE 存在重复数据，正在去重...")
         pipeline = [
             {"$group": {"_id": "$cve_id", "count": {"$sum": 1}, "ids": {"$push": "$_id"}}},
             {"$match": {"count": {"$gt": 1}}},
         ]
         for doc in db[COL_CVES].aggregate(pipeline):
-            # 保留第一个，删除其余
             for oid in doc["ids"][1:]:
                 db[COL_CVES].delete_one({"_id": oid})
         db[COL_CVES].create_index([("cve_id", ASCENDING)], unique=True)
@@ -72,6 +87,8 @@ def init_collections():
 def test_connection():
     try:
         client = get_client()
+        # 触发实际连接
+        client.admin.command("ping")
         db = get_db()
         collections = db.list_collection_names()
         print(f"✅ MongoDB 连接成功！数据库: {db.name}, 集合: {collections}")
@@ -86,19 +103,23 @@ def test_connection():
 # ═══════════════════════════════════
 
 def upsert_cves(data_list):
-    """批量插入/更新 CVE（去重）"""
+    """批量插入/更新 CVE（bulk_write 提升性能）"""
     if not data_list:
         return 0
     db = get_db()
-    count = 0
+    from pymongo import UpdateOne
+    ops = []
+    now = datetime.now().isoformat()
     for cve in data_list:
-        result = db[COL_CVES].update_one(
-            {"cve_id": cve["cve_id"]},
-            {"$set": {**cve, "updated_at": datetime.now().isoformat()}},
-            upsert=True,
+        ops.append(
+            UpdateOne(
+                {"cve_id": cve["cve_id"]},
+                {"$set": {**cve, "updated_at": now}},
+                upsert=True,
+            )
         )
-        if result.upserted_id or result.modified_count:
-            count += 1
+    result = db[COL_CVES].bulk_write(ops)
+    count = result.upserted_count + result.modified_count
     print(f"💾 CVE 入库: 新增/更新 {count} 条")
     return count
 
@@ -138,7 +159,7 @@ def get_cve_stats():
 
 
 # ═══════════════════════════════════
-# 资产操作
+# 资产操作（统一使用数据库，不再依赖 JSON 文件）
 # ═══════════════════════════════════
 
 def add_asset_to_db(product, version="unknown", host="", department=""):
@@ -152,17 +173,28 @@ def add_asset_to_db(product, version="unknown", host="", department=""):
     return "added" if result.upserted_id else "updated"
 
 
-def remove_asset_from_db(product, version="unknown"):
+def remove_asset_from_db(product, version=None):
     """从数据库删除资产"""
     db = get_db()
-    result = db[COL_ASSETS].delete_one({"product": product, "version": version})
+    query = {"product": product}
+    if version:
+        query["version"] = version
+    result = db[COL_ASSETS].delete_one(query)
     return result.deleted_count > 0
 
 
 def get_all_assets():
-    """获取所有资产"""
+    """获取所有资产（从数据库）"""
     db = get_db()
     return list(db[COL_ASSETS].find({}, {"_id": 0}))
+
+
+def load_assets():
+    """兼容接口：从数据库加载资产列表（替换原 JSON 文件读取）"""
+    assets = get_all_assets()
+    if assets:
+        print(f"📦 已加载 {len(assets)} 个资产（数据库）")
+    return assets
 
 
 # ═══════════════════════════════════
@@ -174,15 +206,19 @@ def upsert_risks(risk_list):
     if not risk_list:
         return 0
     db = get_db()
-    count = 0
+    from pymongo import UpdateOne
+    ops = []
+    now = datetime.now().isoformat()
     for risk in risk_list:
-        result = db[COL_RISKS].update_one(
-            {"cve_id": risk["cve_id"], "product": risk["product"]},
-            {"$set": {**risk, "updated_at": datetime.now().isoformat()}},
-            upsert=True,
+        ops.append(
+            UpdateOne(
+                {"cve_id": risk["cve_id"], "product": risk["product"]},
+                {"$set": {**risk, "updated_at": now}},
+                upsert=True,
+            )
         )
-        if result.upserted_id or result.modified_count:
-            count += 1
+    result = db[COL_RISKS].bulk_write(ops)
+    count = result.upserted_count + result.modified_count
     return count
 
 

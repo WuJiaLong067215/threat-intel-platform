@@ -1,62 +1,92 @@
 """
-调度器 - 定时任务管理
+调度器 - 基于 APScheduler 的定时任务管理（后台运行，不阻塞 API）
+
+特点：
+- 后台线程运行，不阻塞 FastAPI
+- 支持 interval / cron 两种触发方式
+- 可动态增删任务
 """
-import schedule
-import time
+import logging
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
-from core.intel_engine import run_full_pipeline
+
+logger = logging.getLogger(__name__)
+
+scheduler = BackgroundScheduler(
+    timezone="Asia/Shanghai",
+    job_defaults={
+        "coalesce": True,       # 错过的任务合并为一次
+        "max_instances": 1,     # 同一任务不并发
+        "misfire_grace_time": 3600,  # 错过1小时内的任务仍执行
+    }
+)
 
 
-class Scheduler:
-    def __init__(self):
-        self._jobs = []
-        self._running = False
+def add_crawl_job(interval_minutes=120, days_back=7, check_exploit=True):
+    """添加定时采集任务"""
+    from core.intel_engine import run_full_pipeline
 
-    def add_crawl_job(self, interval_minutes=120, days_back=7, check_exploit=True):
-        """添加定时采集任务"""
-        def job():
-            run_full_pipeline(days_back=days_back, check_exploit_flag=check_exploit)
-
-        schedule.every(interval_minutes).minutes.do(job)
-        self._jobs.append({
-            "name": f"NVD 采集 (每 {interval_minutes} 分钟)",
-            "func": job,
-            "next_run": "按计划执行",
-        })
-        print(f"⏰ 已注册: NVD 采集任务，间隔 {interval_minutes} 分钟")
-
-    def add_daily_report(self, hour=8, minute=0):
-        """添加每日报告任务"""
-        schedule.every().day.at(f"{hour:02d}:{minute:02d}").do(
-            run_full_pipeline, days_back=1, check_exploit_flag=True
-        )
-        self._jobs.append({
-            "name": f"每日安全简报 ({hour:02d}:{minute:02d})",
-            "func": None,
-            "next_run": f"每天 {hour:02d}:{minute:02d}",
-        })
-        print(f"⏰ 已注册: 每日简报任务，{hour:02d}:{minute:02d}")
-
-    def list_jobs(self):
-        """列出所有任务"""
-        return self._jobs
-
-    def run(self):
-        """启动调度循环"""
-        self._running = True
-        print(f"\n🚀 调度器启动 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        for job in self._jobs:
-            print(f"   - {job['name']}")
-
-        while self._running:
-            schedule.run_pending()
-            time.sleep(10)
-
-    def stop(self):
-        """停止调度"""
-        self._running = False
-        print("🛑 调度器已停止")
+    scheduler.add_job(
+        run_full_pipeline,
+        trigger=IntervalTrigger(minutes=interval_minutes),
+        id="nvd_crawl",
+        name=f"NVD 采集 (每 {interval_minutes} 分钟)",
+        kwargs={"days_back": days_back, "check_exploit_flag": check_exploit},
+        replace_existing=True,
+    )
+    logger.info(f"⏰ 已注册: NVD 采集任务，间隔 {interval_minutes} 分钟")
 
 
-# 全局调度器实例
-scheduler = Scheduler()
+def add_daily_report(hour=8, minute=0):
+    """添加每日报告任务"""
+    from core.intel_engine import run_full_pipeline
+
+    scheduler.add_job(
+        run_full_pipeline,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        id="daily_report",
+        name=f"每日安全简报 ({hour:02d}:{minute:02d})",
+        kwargs={"days_back": 1, "check_exploit_flag": True},
+        replace_existing=True,
+    )
+    logger.info(f"⏰ 已注册: 每日简报任务，{hour:02d}:{minute:02d}")
+
+
+def start():
+    """启动调度器（非阻塞）"""
+    if not scheduler.running:
+        scheduler.start()
+        logger.info(f"🚀 调度器启动 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        for job in scheduler.get_jobs():
+            logger.info(f"   - {job.name} | 下次执行: {job.next_run_time}")
+
+
+def stop():
+    """停止调度器"""
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("🛑 调度器已停止")
+
+
+def list_jobs():
+    """列出所有任务"""
+    return [
+        {
+            "id": job.id,
+            "name": job.name,
+            "next_run": str(job.next_run_time) if job.next_run_time else None,
+            "trigger": str(job.trigger),
+        }
+        for job in scheduler.get_jobs()
+    ]
+
+
+def get_status():
+    """调度器状态"""
+    return {
+        "running": scheduler.running,
+        "jobs_count": len(scheduler.get_jobs()),
+        "jobs": list_jobs(),
+    }

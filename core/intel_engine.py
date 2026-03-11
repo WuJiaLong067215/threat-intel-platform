@@ -1,13 +1,20 @@
 """
-情报引擎 - 核心编排层
+情报引擎 - 核心编排层（v2.0）
 
 统一编排：采集 → 分析 → Exploit → 资产匹配 → 风险评分 → 存储 → 报告
+
+改进：
+- 使用 fetch_all_cves 全量拉取
+- 适配新的 asset_matcher 和 db_manager 接口
+- 结构化日志
 """
+import logging
 from datetime import datetime
-from crawler.nvd_crawler import fetch_recent_cves, parse_cve_data
+
+from crawler.nvd_crawler import fetch_all_cves, parse_cve_data
 from analyzer.vuln_analyzer import generate_summary
 from analyzer.exploit_detector import batch_check_exploits
-from analyzer.asset_matcher import match_assets, load_assets
+from analyzer.asset_matcher import match_assets
 from analyzer.risk_engine import rank_cves
 from report.report_generator import generate_daily_brief, save_report as save_file
 from database.db_manager import (
@@ -15,23 +22,25 @@ from database.db_manager import (
     find_cves, get_dashboard_stats,
 )
 
+logger = logging.getLogger(__name__)
 
-def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=20):
+
+def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=500):
     """
     执行完整的情报流水线
 
     Args:
         days_back: 回溯天数
         check_exploit_flag: 是否检测 Exploit
-        limit: 每次采集数量
+        limit: 最多采集数量
 
     Returns:
         dict: 流水线执行结果
     """
     start_time = datetime.now()
-    print(f"\n{'='*60}")
-    print(f"🔄 情报引擎启动 | {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*60}")
+    logger.info(f"{'='*60}")
+    logger.info(f"🔄 情报引擎启动 | {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"{'='*60}")
 
     result = {
         "status": "running",
@@ -44,22 +53,22 @@ def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=20):
         "errors": [],
     }
 
-    # ── Step 1: 采集 ──
-    print("\n📡 Step 1: 采集 CVE 情报...")
-    raw = fetch_recent_cves(days_back=days_back, results_per_page=limit)
-    if not raw:
+    # ── Step 1: 全量采集 ──
+    logger.info("📡 Step 1: 采集 CVE 情报（全量分页）...")
+    vulns = fetch_all_cves(days_back=days_back, max_total=limit)
+    if not vulns:
         result["status"] = "failed"
         result["errors"].append("NVD API 采集失败")
         result["finished_at"] = datetime.now().isoformat()
         return result
 
-    cves = parse_cve_data(raw)
+    cves = parse_cve_data(vulns)
     result["cves_collected"] = len(cves)
-    print(f"   获取 {len(cves)} 条 CVE")
+    logger.info(f"   获取 {len(cves)} 条 CVE")
 
     # ── Step 2: Exploit 检测 ──
     if check_exploit_flag:
-        print("\n🔥 Step 2: Exploit 检测...")
+        logger.info("🔥 Step 2: Exploit 检测...")
         cves = batch_check_exploits(cves, max_workers=3, delay=1.0)
         result["exploits_checked"] = sum(
             1 for c in cves
@@ -67,30 +76,28 @@ def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=20):
         )
         result["exploits_found"] = result["exploits_checked"]
     else:
-        # 无 exploit 检测时补默认值
         for c in cves:
             c.setdefault("exploit", {"has_exploit": False, "source": None, "details": "未检测"})
 
     # ── Step 3: 资产匹配 ──
-    print("\n🎯 Step 3: 资产匹配...")
+    logger.info("🎯 Step 3: 资产匹配...")
     alerts = match_assets(cves)
     result["asset_hits"] = len(alerts)
 
     # ── Step 4: 风险评分 ──
-    print("\n⚡ Step 4: 风险评分...")
+    logger.info("⚡ Step 4: 风险评分...")
     ranked = rank_cves(cves, top_n=50)
 
     # ── Step 5: 生成报告 ──
-    print("\n📊 Step 5: 生成简报...")
+    logger.info("📊 Step 5: 生成简报...")
     summary = generate_summary(cves)
     brief = generate_daily_brief(summary, alerts, ranked)
-    print(brief)
+    logger.info(brief[:500] + "...")
 
     # ── Step 6: 写入数据库 ──
-    print("\n💾 Step 6: 写入数据库...")
+    logger.info("💾 Step 6: 写入数据库...")
     cve_count = upsert_cves(cves)
 
-    # 写入风险关联
     risk_records = []
     for alert in alerts:
         risk_records.append({
@@ -99,6 +106,7 @@ def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=20):
             "version": alert.get("version", "unknown"),
             "severity": alert.get("severity", "unknown"),
             "score": alert.get("score", 0),
+            "match_method": alert.get("match_method", "unknown"),
             "risk_score": next(
                 (r["risk_score"] for r in ranked if r["cve_id"] == alert["cve_id"]), 0
             ),
@@ -110,7 +118,6 @@ def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=20):
     risk_count = upsert_risks(risk_records)
     result["risks_written"] = risk_count
 
-    # 保存报告到数据库
     save_report_to_db({
         "date": datetime.now().strftime("%Y-%m-%d"),
         "total_cves": len(cves),
@@ -121,7 +128,6 @@ def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=20):
         "text": brief,
     })
 
-    # 保存报告文件
     save_file(brief)
 
     # ── 完成 ──
@@ -130,8 +136,8 @@ def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=20):
     result["finished_at"] = datetime.now().isoformat()
     result["elapsed_seconds"] = round(elapsed, 1)
 
-    print(f"\n✅ 流水线完成 ({elapsed:.1f}s)")
-    print(f"   CVE: {len(cves)} | Exploit: {result['exploits_found']} | 资产命中: {len(alerts)} | 风险: {risk_count}")
+    logger.info(f"✅ 流水线完成 ({elapsed:.1f}s)")
+    logger.info(f"   CVE: {len(cves)} | Exploit: {result['exploits_found']} | 资产命中: {len(alerts)} | 风险: {risk_count}")
 
     return result
 

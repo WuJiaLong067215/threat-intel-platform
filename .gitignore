@@ -1,6 +1,10 @@
 .env
-venv/
+.venv/
 __pycache__/
 *.pyc
 .idea/
-*.log
+memory/app.log
+memory/brief_*.txt
+*.egg-info/
+dist/
+build/

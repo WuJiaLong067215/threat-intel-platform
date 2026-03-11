@@ -29,10 +29,16 @@
     .fade-enter-from, .fade-leave-to { opacity: 0; }
     .pulse-dot { animation: pulse 2s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .loading { opacity: 0.5; pointer-events: none; }
+    .toast { position: fixed; top: 20px; right: 20px; z-index: 9999; padding: 12px 20px; border-radius: 8px; background: #1e293b; border: 1px solid #334155; color: #e2e8f0; font-size: 14px; animation: slideIn 0.3s ease; }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
   </style>
 </head>
 <body>
 <div id="app">
+  <!-- Toast 通知 -->
+  <div v-if="toast" class="toast">{{ toast }}</div>
+
   <div class="flex h-screen">
     <!-- Sidebar -->
     <aside class="w-56 bg-[#0d1117] border-r border-[#1e293b] flex flex-col shrink-0">
@@ -40,7 +46,7 @@
         <h1 class="text-lg font-bold flex items-center gap-2">
           <span class="text-2xl">🛡️</span> 威胁情报平台
         </h1>
-        <p class="text-xs text-gray-500 mt-1 mono">Threat Intel Platform</p>
+        <p class="text-xs text-gray-500 mt-1 mono">Threat Intel Platform v4.0</p>
       </div>
       <nav class="flex-1 py-3">
         <div v-for="item in navItems" :key="item.key"
@@ -67,22 +73,22 @@
         <div class="grid grid-cols-4 gap-4 mb-6">
           <div class="card stat-card rounded-xl p-5 glow">
             <div class="text-gray-400 text-sm">总漏洞数</div>
-            <div class="text-3xl font-bold mt-2 mono">{{ stats.total_cves || 0 }}</div>
+            <div class="text-3xl font-bold mt-2 mono">{{ dashStats.total_cves || 0 }}</div>
             <div class="text-xs text-gray-500 mt-1">数据库记录</div>
           </div>
           <div class="card stat-card rounded-xl p-5" style="box-shadow: 0 0 20px rgba(239,68,68,0.1)">
             <div class="text-gray-400 text-sm">严重漏洞</div>
-            <div class="text-3xl font-bold mt-2 mono text-red-400">{{ stats.critical || 0 }}</div>
+            <div class="text-3xl font-bold mt-2 mono text-red-400">{{ dashStats.high_risk || 0 }}</div>
             <div class="text-xs text-gray-500 mt-1">CRITICAL + HIGH</div>
           </div>
           <div class="card stat-card rounded-xl p-5" style="box-shadow: 0 0 20px rgba(251,146,60,0.1)">
             <div class="text-gray-400 text-sm">存在 Exploit</div>
-            <div class="text-3xl font-bold mt-2 mono text-orange-400">{{ stats.exploited || 0 }}</div>
+            <div class="text-3xl font-bold mt-2 mono text-orange-400">{{ dashStats.exploited || 0 }}</div>
             <div class="text-xs text-gray-500 mt-1">有公开利用代码</div>
           </div>
           <div class="card stat-card rounded-xl p-5" style="box-shadow: 0 0 20px rgba(59,130,246,0.1)">
             <div class="text-gray-400 text-sm">影响资产</div>
-            <div class="text-3xl font-bold mt-2 mono text-blue-400">{{ assetAlerts.length }}</div>
+            <div class="text-3xl font-bold mt-2 mono text-blue-400">{{ dashStats.total_risks || 0 }}</div>
             <div class="text-xs text-gray-500 mt-1">需紧急处理</div>
           </div>
         </div>
@@ -107,10 +113,13 @@
             <div v-for="(cve, i) in riskTop" :key="i" class="flex items-center gap-3 py-2 border-b border-gray-800 last:border-0">
               <span class="text-sm mono w-6 text-gray-500">#{{ i + 1 }}</span>
               <span class="mono text-sm flex-1">{{ cve.cve_id }}</span>
-              <span :class="'severity-' + (cve.risk_level || cve.severity || 'LOW').toLowerCase() + ' px-2 py-0.5 rounded text-xs'">
-                {{ cve.risk_level || cve.severity }}
+              <span :class="'severity-' + (cve.risk_level || 'LOW').toLowerCase() + ' px-2 py-0.5 rounded text-xs'">
+                {{ cve.risk_level }}
               </span>
-              <span class="mono text-sm text-gray-400">{{ cve.risk_score || cve.score }}</span>
+              <span class="mono text-sm text-gray-400">{{ cve.risk_score }}</span>
+            </div>
+            <div v-if="riskTop.length === 0" class="text-center py-8 text-gray-500 text-sm">
+              暂无数据，请先同步 CVE
             </div>
           </div>
         </div>
@@ -120,9 +129,24 @@
       <div v-if="page === 'intel'">
         <div class="flex justify-between items-center mb-6">
           <h2 class="text-xl font-bold">🔍 情报中心</h2>
-          <button @click="refreshCves" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-medium transition">
-            🔄 刷新数据
-          </button>
+          <div class="flex gap-3">
+            <select v-model="severityFilter" @change="fetchCves"
+                    class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+              <option value="">全部级别</option>
+              <option value="CRITICAL">CRITICAL</option>
+              <option value="HIGH">HIGH</option>
+              <option value="MEDIUM">MEDIUM</option>
+              <option value="LOW">LOW</option>
+            </select>
+            <button @click="syncCves" :class="{'opacity-50': syncing}"
+                    class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-medium transition">
+              🔄 {{ syncing ? '同步中...' : '同步数据' }}
+            </button>
+          </div>
+        </div>
+        <!-- 总数信息 -->
+        <div v-if="cvesTotal > 0" class="text-sm text-gray-500 mb-3">
+          共 {{ cvesTotal }} 条，当前显示 {{ cves.length }} 条
         </div>
         <div class="card rounded-xl overflow-hidden">
           <table class="w-full text-sm">
@@ -160,7 +184,7 @@
             </tbody>
           </table>
           <div v-if="cves.length === 0" class="text-center py-12 text-gray-500">
-            暂无数据，点击"刷新数据"或运行同步
+            暂无数据，点击"同步数据"拉取最新 CVE
           </div>
         </div>
       </div>
@@ -171,9 +195,9 @@
         <div class="card rounded-xl p-5 mb-6">
           <h3 class="font-semibold mb-4">添加资产</h3>
           <div class="flex gap-3">
-            <input v-model="newProduct" placeholder="产品名称（如 Apache）"
+            <input v-model="newProduct" placeholder="产品名称（如 Apache）" @keyup.enter="addAsset"
                    class="bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-sm flex-1 focus:outline-none focus:border-blue-500">
-            <input v-model="newVersion" placeholder="版本（如 2.4）"
+            <input v-model="newVersion" placeholder="版本（如 2.4）" @keyup.enter="addAsset"
                    class="bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-sm w-40 focus:outline-none focus:border-blue-500">
             <button @click="addAsset" class="bg-blue-600 hover:bg-blue-700 px-5 py-2 rounded-lg text-sm font-medium transition">
               ➕ 添加
@@ -186,6 +210,7 @@
               <tr>
                 <th class="text-left px-4 py-3 font-medium text-gray-400">产品</th>
                 <th class="text-left px-4 py-3 font-medium text-gray-400">版本</th>
+                <th class="text-left px-4 py-3 font-medium text-gray-400">主机</th>
                 <th class="text-left px-4 py-3 font-medium text-gray-400">操作</th>
               </tr>
             </thead>
@@ -193,6 +218,7 @@
               <tr v-for="(asset, i) in assets" :key="i" class="border-t border-gray-800/50">
                 <td class="px-4 py-3 font-medium">{{ asset.product }}</td>
                 <td class="px-4 py-3 mono text-gray-400">{{ asset.version }}</td>
+                <td class="px-4 py-3 mono text-gray-500 text-xs">{{ asset.host || '—' }}</td>
                 <td class="px-4 py-3">
                   <button @click="removeAsset(asset.product)" class="text-red-400 hover:text-red-300 text-xs transition">
                     🗑️ 删除
@@ -228,18 +254,32 @@ const { createApp, ref, computed, onMounted } = Vue
 
 const API = ''
 
+function showToast(msg) {
+  // 简单 toast
+  let el = document.querySelector('.toast')
+  if (el) el.remove()
+  el = document.createElement('div')
+  el.className = 'toast'
+  el.textContent = msg
+  document.body.appendChild(el)
+  setTimeout(() => el.remove(), 3000)
+}
+
 createApp({
   setup() {
     const page = ref('dashboard')
     const cves = ref([])
+    const cvesTotal = ref(0)
     const assets = ref([])
-    const assetAlerts = ref([])
     const briefText = ref('')
-    const stats = ref({})
+    const dashStats = ref({})
     const severityDist = ref({})
     const riskTop = ref([])
     const newProduct = ref('')
     const newVersion = ref('')
+    const severityFilter = ref('')
+    const syncing = ref(false)
+    const toast = ref('')
 
     const navItems = [
       { key: 'dashboard', label: '风险看板', icon: '📊' },
@@ -248,50 +288,70 @@ createApp({
       { key: 'reports', label: '情报报告', icon: '📋' },
     ]
 
-    async function fetchAll() {
+    function showToast(msg) {
+      toast.value = msg
+      setTimeout(() => toast.value = '', 3000)
+    }
+
+    async function fetchDashboard() {
       try {
-        const [cvesRes, assetsRes, briefRes] = await Promise.all([
-          fetch(API + '/api/cves?limit=100').then(r => r.json()),
-          fetch(API + '/api/assets').then(r => r.json()),
-          fetch(API + '/api/brief').then(r => r.json()).catch(() => ({ text: '' })),
-        ])
-        cves.value = cvesRes.data || []
-        assets.value = assetsRes.assets || []
-        briefText.value = briefRes.text || ''
-
-        // Stats
-        const all = cves.value
-        stats.value.total_cves = all.length
-        stats.value.critical = all.filter(c => (c.severity || '').toUpperCase() === 'CRITICAL' || (c.severity || '').toUpperCase() === 'HIGH').length
-        stats.value.exploited = all.filter(c => hasExploit(c)).length
-
-        // Severity distribution
-        const dist = {}
-        all.forEach(c => {
-          const s = (c.severity || 'UNKNOWN').toUpperCase()
-          dist[s] = (dist[s] || 0) + 1
-        })
-        severityDist.value = dist
-
-        // Risk top
-        riskTop.value = all.slice(0, 10).sort((a, b) => (b.risk_score || b.score || 0) - (a.risk_score || a.score || 0))
-
-        // Asset alerts
-        assetAlerts.value = all.filter(c => c.asset_hit)
+        const res = await fetch(API + '/api/dashboard')
+        dashStats.value = await res.json()
+        severityDist.value = dashStats.value.severity_distribution || {}
       } catch (e) {
-        console.error('Failed to fetch:', e)
+        console.error('Dashboard fetch failed:', e)
       }
     }
 
-    async function refreshCves() {
+    async function fetchCves() {
       try {
-        const res = await fetch(API + '/api/sync?days_back=7', { method: 'POST' })
+        const params = new URLSearchParams({ limit: '200' })
+        if (severityFilter.value) params.set('severity', severityFilter.value)
+        const res = await fetch(API + '/api/cves?' + params)
+        const data = await res.json()
+        cves.value = data.data || []
+        cvesTotal.value = data.total || 0
+      } catch (e) {
+        console.error('CVE fetch failed:', e)
+      }
+    }
+
+    async function fetchRiskTop() {
+      try {
+        const res = await fetch(API + '/api/risk-ranking?top_n=10')
+        const data = await res.json()
+        riskTop.value = data.data || []
+      } catch (e) {
+        console.error('Risk ranking fetch failed:', e)
+      }
+    }
+
+    async function fetchAssets() {
+      try {
+        const res = await fetch(API + '/api/assets')
+        const data = await res.json()
+        assets.value = data.assets || []
+      } catch (e) {
+        console.error('Assets fetch failed:', e)
+      }
+    }
+
+    async function syncCves() {
+      if (syncing.value) return
+      syncing.value = true
+      try {
+        const res = await fetch(API + '/api/sync?days_back=7&full=true', { method: 'POST' })
         const data = await res.json()
         if (data.status === 'ok') {
+          showToast(`✅ 同步完成，新增/更新 ${data.synced} 条 CVE`)
           await fetchAll()
+        } else {
+          showToast('❌ 同步失败: ' + (data.message || '未知错误'))
         }
       } catch (e) {
-        alert('同步失败: ' + e.message)
+        showToast('❌ 同步失败: ' + e.message)
+      } finally {
+        syncing.value = false
       }
     }
 
@@ -303,11 +363,12 @@ createApp({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ product: newProduct.value, version: newVersion.value || 'unknown' }),
         })
+        showToast(`✅ 资产 ${newProduct.value} 已添加`)
         newProduct.value = ''
         newVersion.value = ''
-        await fetchAll()
+        await fetchAssets()
       } catch (e) {
-        alert('添加失败: ' + e.message)
+        showToast('❌ 添加失败: ' + e.message)
       }
     }
 
@@ -315,9 +376,10 @@ createApp({
       if (!confirm('确认删除资产 ' + product + '?')) return
       try {
         await fetch(API + '/api/assets/' + encodeURIComponent(product), { method: 'DELETE' })
-        await fetchAll()
+        showToast(`✅ 资产 ${product} 已删除`)
+        await fetchAssets()
       } catch (e) {
-        alert('删除失败: ' + e.message)
+        showToast('❌ 删除失败: ' + e.message)
       }
     }
 
@@ -327,7 +389,7 @@ createApp({
         const data = await res.json()
         briefText.value = data.text || '暂无报告'
       } catch (e) {
-        alert('获取报告失败: ' + e.message)
+        showToast('❌ 获取报告失败: ' + e.message)
       }
     }
 
@@ -358,12 +420,17 @@ createApp({
       return map[(level || '').toUpperCase()] || 'bg-gray-500'
     }
 
+    async function fetchAll() {
+      await Promise.all([fetchDashboard(), fetchCves(), fetchRiskTop(), fetchAssets()])
+    }
+
     onMounted(fetchAll)
 
     return {
-      page, navItems, cves, assets, assetAlerts, briefText, stats,
-      severityDist, riskTop, newProduct, newVersion,
-      refreshCves, addAsset, removeAsset, fetchBrief,
+      page, navItems, cves, cvesTotal, assets, briefText, dashStats,
+      severityDist, riskTop, newProduct, newVersion, severityFilter,
+      syncing, toast,
+      syncCves, addAsset, removeAsset, fetchBrief, fetchCves, fetchAll,
       hasExploit, exploitSource, formatDate,
       severityPercent, barColor,
     }
