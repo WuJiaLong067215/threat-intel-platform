@@ -1,0 +1,26 @@
+[
+  {
+    "product": "Apache",
+    "version": "2.4"
+  },
+  {
+    "product": "Windows Server",
+    "version": "2019"
+  },
+  {
+    "product": "VMware",
+    "version": "7"
+  },
+  {
+    "product": "Nginx",
+    "version": "1.24"
+  },
+  {
+    "product": "OpenSSL",
+    "version": "3.0"
+  },
+  {
+    "product": "Linux",
+    "version": "kernel"
+  }
+]
