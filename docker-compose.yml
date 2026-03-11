@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # MongoDB 数据库
+  mongodb:
+    image: mongo:7
+    container_name: tip-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: threat_intel
+    command: --auth
+
+  # 威胁情报平台 API
+  api:
+    build: .
+    container_name: tip-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/
+      - MONGO_DB=threat_intel
+      - JWT_SECRET=change-me-in-production-please
+      - JWT_EXPIRE_HOURS=24
+      - NVD_API_KEY=${NVD_API_KEY:-}
+      - API_KEY=${API_KEY:-}
+    depends_on:
+      - mongodb
+    volumes:
+      - ./memory:/app/memory
+      - ./web:/app/web
+
+  # Nginx 反代（生产环境）
+  nginx:
+    image: nginx:alpine
+    container_name: tip-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+    profiles:
+      - production
+
+volumes:
+  mongodb_data:

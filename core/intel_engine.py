@@ -12,6 +12,8 @@ import logging
 from datetime import datetime
 
 from crawler.nvd_crawler import fetch_all_cves, parse_cve_data
+from crawler.cnvd_crawler import fetch_cnvd_list
+from crawler.github_advisory import fetch_github_advisories
 from analyzer.vuln_analyzer import generate_summary
 from analyzer.exploit_detector import batch_check_exploits
 from analyzer.asset_matcher import match_assets
@@ -23,6 +25,39 @@ from database.db_manager import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _fetch_all_sources(days_back=7, limit=500):
+    """从所有数据源采集漏洞"""
+    all_cves = []
+
+    # NVD
+    logger.info("📡 NVD 采集...")
+    vulns = fetch_all_cves(days_back=days_back, max_total=limit)
+    if vulns:
+        nvd_cves = parse_cve_data(vulns)
+        all_cves.extend(nvd_cves)
+        logger.info(f"   NVD: {len(nvd_cves)} 条")
+
+    # CNVD
+    try:
+        logger.info("📡 CNVD 采集...")
+        cnvd_cves = fetch_cnvd_list(days_back=days_back, max_pages=2)
+        all_cves.extend(cnvd_cves)
+        logger.info(f"   CNVD: {len(cnvd_cves)} 条")
+    except Exception as e:
+        logger.warning(f"   CNVD 采集失败: {e}")
+
+    # GitHub Advisory
+    try:
+        logger.info("📡 GitHub Advisory 采集...")
+        gh_cves = fetch_github_advisories(days_back=min(days_back, 30), max_results=100)
+        all_cves.extend(gh_cves)
+        logger.info(f"   GitHub: {len(gh_cves)} 条")
+    except Exception as e:
+        logger.warning(f"   GitHub Advisory 采集失败: {e}")
+
+    return all_cves
 
 
 def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=500):
@@ -53,16 +88,9 @@ def run_full_pipeline(days_back=7, check_exploit_flag=True, limit=500):
         "errors": [],
     }
 
-    # ── Step 1: 全量采集 ──
-    logger.info("📡 Step 1: 采集 CVE 情报（全量分页）...")
-    vulns = fetch_all_cves(days_back=days_back, max_total=limit)
-    if not vulns:
-        result["status"] = "failed"
-        result["errors"].append("NVD API 采集失败")
-        result["finished_at"] = datetime.now().isoformat()
-        return result
-
-    cves = parse_cve_data(vulns)
+    # ── Step 1: 多源采集 ──
+    logger.info("📡 Step 1: 多源采集 CVE/NVD/CNVD/GitHub...")
+    cves = _fetch_all_sources(days_back=days_back, limit=limit)
     result["cves_collected"] = len(cves)
     logger.info(f"   获取 {len(cves)} 条 CVE")
 

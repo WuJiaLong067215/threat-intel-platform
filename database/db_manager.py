@@ -81,6 +81,12 @@ def init_collections():
     # Reports 索引
     db[COL_REPORTS].create_index([("date", DESCENDING)], unique=True)
 
+    # Users 索引
+    db["users"].create_index([("username", ASCENDING)], unique=True)
+
+    # Audit 索引
+    db["audit_logs"].create_index([("timestamp", DESCENDING)])
+
     print("✅ 数据库索引初始化完成")
 
 
